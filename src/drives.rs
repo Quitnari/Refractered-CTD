@@ -5,31 +5,49 @@
 //
 // CURIOSIDAD
 // ──────────
-// Tensión alta + distribuida uniformemente por todo el campo.
+// Actividad significativa + error distribuido uniformemente por el campo.
 // Significa: el campo tiene errores de predicción en todas partes.
 // No entiende lo que está percibiendo.
 // Drive resultante: explorar — buscar inputs que reduzcan la incertidumbre.
 //
-// Fórmula: curiosity = mean_tension × (1 - normalized_variance)
-// Alta tensión media + baja varianza = error uniformemente distribuido.
+// Fórmula: curiosity = activity × (1 - norm_var)
+// activity = sigmoide(mean_tension) — activa desde ~0.02 de tensión.
+// Alta actividad + baja varianza relativa = error uniformemente distribuido.
 //
 // MALESTAR
 // ────────
-// Tensión alta + concentrada en pocas unidades (varianza alta).
+// Actividad significativa + error concentrado en pocas unidades.
 // Significa: hay una inconsistencia local fuerte — el campo predice bien
 // en general pero falla gravemente en alguna región.
 // Drive resultante: actuar para resolver esa inconsistencia específica.
 //
-// Fórmula: discomfort = mean_tension × normalized_variance
+// Fórmula: discomfort = activity × norm_var
 // Alta varianza relativa = inconsistencia focal.
 //
 // CALMA
 // ─────
-// Tensión baja en general.
+// Actividad baja en general.
 // Significa: el campo está en un estado coherente con sus expectativas.
 // Drive resultante: consolidar — mantener lo que funciona.
 //
-// Fórmula: calm = 1 - mean_tension (invertido)
+// Fórmula: calm = 1 - activity
+//
+// POR QUÉ SIGMOIDE Y NO mean_tension DIRECTA
+// ───────────────────────────────────────────
+// Con la fórmula original (curiosity = mean_tension × ...):
+//   Un campo convergido tiene mean_tension ≈ 0.001–0.005.
+//   Curiosidad y malestar quedan acotados a esos valores diminutos.
+//   La calma (1 - mean_tension ≈ 0.999) siempre aplasta a los otros dos.
+//   Los drives de "alerta" nunca pueden emerger con fuerza.
+//
+// La sigmoide con punto de inflexión en 0.12 y pendiente k=25:
+//   mean_tension=0.00 → activity≈0.05  (reposo — calm=0.95, correcto)
+//   mean_tension=0.05 → activity≈0.18  (activación leve)
+//   mean_tension=0.12 → activity≈0.50  (umbral central)
+//   mean_tension=0.20 → activity≈0.87  (actividad alta)
+// Esto permite que curiosidad y malestar alcancen valores significativos
+// con tensiones moderadas (0.05–0.3), mientras la calma es alta
+// cuando el campo predice bien (tensión < 0.05).
 //
 // VITALIDAD
 // ─────────
@@ -78,23 +96,47 @@ pub struct DriveState {
 impl DriveState {
     /// Calcular drives desde métricas crudas del campo.
     pub fn from_field(mean_tension: f32, var_tension: f32, connection_count: usize) -> Self {
-        // Normalizar varianza respecto a la tensión media para obtener
-        // una medida relativa de concentración del error.
-        // Si mean_tension ≈ 0, la varianza no tiene sentido — todo es calma.
+        // ── Geometría de la tensión ────────────────────────────────────────
+        // norm_var: coeficiente de variación (CV) = std / mean.
+        // Mide si la tensión está distribuida (CV bajo) o concentrada (CV alto).
+        // Con mean_tension ≈ 0 no tiene sentido — todo es calma.
         let norm_var = if mean_tension > 0.001 {
             (var_tension.sqrt() / mean_tension).clamp(0.0, 1.0)
         } else {
             0.0
         };
 
-        // Curiosidad: tensión alta + error bien distribuido (var relativa baja)
-        let curiosity = (mean_tension * (1.0 - norm_var)).clamp(0.0, 1.0);
+        // ── Señal de actividad relativa ───────────────────────────────────
+        // El problema de curiosity = mean_tension × (1-norm_var) es que
+        // queda acotada por mean_tension (~0.001 en campo convergido).
+        // Un campo que predice bien DEBE tener tensión baja — eso es correcto.
+        // Pero entonces curiosidad y malestar nunca pueden emerger con fuerza.
+        //
+        // Solución: medir la geometría de tensión de forma independiente a
+        // su escala absoluta, usando una señal de actividad normalizada.
+        //
+        // activity: sigmoide centrada en 0.12, pendiente k=25.
+        //   mean_tension=0.00 → activity≈0.05  (reposo — calm≈0.95)
+        //   mean_tension=0.05 → activity≈0.18  (activación leve)
+        //   mean_tension=0.12 → activity≈0.50  (umbral central)
+        //   mean_tension=0.20 → activity≈0.87  (actividad alta)
+        //   mean_tension=0.50 → activity≈1.00  (saturación)
+        let k = 25.0f32;
+        let center = 0.12f32;
+        let activity = (1.0 / (1.0 + (-k * (mean_tension - center)).exp())).clamp(0.0, 1.0);
 
-        // Malestar: tensión alta + error concentrado (var relativa alta)
-        let discomfort = (mean_tension * norm_var).clamp(0.0, 1.0);
+        // Curiosidad: actividad presente + error bien distribuido (norm_var bajo)
+        // El campo "no entiende" uniformemente — impulso a explorar.
+        let curiosity = (activity * (1.0 - norm_var)).clamp(0.0, 1.0);
 
-        // Calma: inversamente proporcional a la tensión media
-        let calm = (1.0 - mean_tension).clamp(0.0, 1.0);
+        // Malestar: actividad presente + error concentrado (norm_var alto)
+        // El campo falla focalmente — impulso a resolver esa inconsistencia.
+        let discomfort = (activity * norm_var).clamp(0.0, 1.0);
+
+        // Calma: inversamente proporcional a la actividad (no a mean_tension crudo)
+        // Esto hace que la calma no sea simplemente "1 - tensión mínima"
+        // sino "ausencia de actividad significativa".
+        let calm = (1.0 - activity).clamp(0.0, 1.0);
 
         // Vitalidad: función del número de conexiones
         // Umbrales arbitrarios calibrables — 500 conns = 100% vitalidad

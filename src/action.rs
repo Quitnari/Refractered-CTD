@@ -70,6 +70,12 @@ pub struct ActionModule {
 
     /// Exploración base — modulada por drives en cada tick.
     base_exploration: f32,
+
+    /// Huella del input anterior — usada para detectar cambios de contexto.
+    /// Cuando el input cambia bruscamente, el momentum se amortigua
+    /// para no contaminar la respuesta a la nueva situación.
+    /// Solo los primeros `FINGERPRINT_SIZE` componentes del output proyectado.
+    last_fingerprint: Vec<f32>,
 }
 
 impl ActionModule {
@@ -100,8 +106,9 @@ impl ActionModule {
             action_size,
             projection,
             momentum:         vec![0.0; action_size],
-            momentum_decay:   0.7,
+            momentum_decay:   0.80,
             base_exploration: 0.1,
+            last_fingerprint: vec![0.0; action_size],
         }
     }
 
@@ -109,6 +116,30 @@ impl ActionModule {
     pub fn act(&mut self, field_output: &[f32], drives: &DriveState) -> CtdAction {
         // 1. Proyectar output del campo al espacio de acciones
         let mut projected = self.project(field_output);
+
+        // 1b. Detección de cambio de contexto
+        // Si el input proyectado difiere bruscamente del anterior, el momentum
+        // de la situación previa contaminaría la respuesta actual.
+        // Calculamos la distancia L2 entre el proyectado actual y la huella anterior.
+        // Si supera el umbral, amortiguamos el momentum proporcionalmente al cambio.
+        let context_shift: f32 = projected.iter().zip(self.last_fingerprint.iter())
+        .map(|(&a, &b)| (a - b).powi(2))
+        .sum::<f32>()
+        .sqrt();
+        // Umbral empírico: cambio > 0.5 en L2 sobre el vector normalizado
+        // indica una situación distinta, no ruido tick a tick.
+        let shift_threshold = 0.5f32;
+        if context_shift > shift_threshold {
+            // Amortiguar momentum proporcionalmente al tamaño del cambio.
+            // Cambio = 0.5 → factor ~1.0 (sin efecto)
+            // Cambio = 1.5 → factor ~0.33 (momentum casi eliminado)
+            let decay = (shift_threshold / context_shift).clamp(0.1, 1.0);
+            for v in self.momentum.iter_mut() {
+                *v *= decay;
+            }
+        }
+        // Actualizar huella con la proyección actual
+        self.last_fingerprint.clone_from(&projected);
 
         // 2. Modular intensidad por malestar
         // Más malestar → acción más intensa (amplificar señal)
@@ -196,6 +227,7 @@ impl ActionModule {
     /// Resetear momentum al inicio de episodio.
     pub fn reset_episode(&mut self) {
         self.momentum.iter_mut().for_each(|v| *v = 0.0);
+        self.last_fingerprint.iter_mut().for_each(|v| *v = 0.0);
     }
 
     /// Ajustar exploración base.
