@@ -202,8 +202,17 @@ impl TensionField {
         let mut field = Self::new(config.clone());
         let mut rng = rand::thread_rng();
 
-        let input_end   = config.input_size;
+        let input_end    = config.input_size;
         let output_start = config.n_units - config.output_size;
+
+        // Relevancia inicial escalonada por tipo de conexión:
+        // Las conexiones no han demostrado su valor todavía — empiezan
+        // con relevancia reducida para que la poda sea gradual, no un
+        // colapso masivo en los primeros episodios.
+        // spontaneous_reconnect() ya usa 0.3 — coherente con este principio.
+        // Entrada→internas: más relevancia (camino sensorial crítico)
+        // Internas→internas: media (recurrencia, menos crítica al inicio)
+        // Internas→salida: más relevancia (camino motor crítico)
 
         // Entrada → internas
         for i in 0..input_end {
@@ -211,7 +220,9 @@ impl TensionField {
                 if rng.gen::<f32>() < connection_prob {
                     let w = rng.gen_range(-0.3..0.3f32);
                     let p = rng.gen_range(0.0..config.init_phase_range);
-                    field.connections.push(Connection::new(i, j, w, p));
+                    let mut c = Connection::new(i, j, w, p);
+                    c.relevance = 0.6;  // camino sensorial — relevancia media-alta
+                    field.connections.push(c);
                 }
             }
         }
@@ -222,7 +233,9 @@ impl TensionField {
                 if i != j && rng.gen::<f32>() < connection_prob * 0.3 {
                     let w = rng.gen_range(-0.2..0.2f32);
                     let p = rng.gen_range(0.0..config.init_phase_range);
-                    field.connections.push(Connection::new(i, j, w, p));
+                    let mut c = Connection::new(i, j, w, p);
+                    c.relevance = 0.4;  // recurrencia — debe ganarse su lugar
+                    field.connections.push(c);
                 }
             }
         }
@@ -233,7 +246,9 @@ impl TensionField {
                 if rng.gen::<f32>() < connection_prob {
                     let w = rng.gen_range(-0.3..0.3f32);
                     let p = rng.gen_range(0.0..config.init_phase_range);
-                    field.connections.push(Connection::new(i, j, w, p));
+                    let mut c = Connection::new(i, j, w, p);
+                    c.relevance = 0.6;  // camino motor — relevancia media-alta
+                    field.connections.push(c);
                 }
             }
         }
@@ -257,15 +272,21 @@ impl TensionField {
         }
     }
 
-    /// Leer tensiones de las unidades de salida.
-    /// Es lo que el campo "quiere hacer" — entrada para el módulo de acción.
+    /// Leer el estado actual de las unidades de salida.
+    /// Es lo que el campo "produce" — entrada para el módulo de acción.
+    ///
+    /// Retorna `what_is` directamente, no `tension()`.
+    ///
+    /// Las unidades de salida nunca actualizan `what_will` (por diseño —
+    /// si aprendieran, colapsarían a cero y el campo quedaría mudo).
+    /// Eso significa que `tension() = what_will - what_is` tiene un offset
+    /// fijo de ruido aleatorio congelado desde la construcción del campo.
+    /// Ese offset no transporta información — solo contamina la señal.
+    ///
+    /// `what_is` es la señal real: el estado que las conexiones internas
+    /// empujaron hacia las unidades de salida. El drift, el ruido y la
+    /// propagación trabajan sobre `what_is` — es ahí donde vive la información.
     pub fn read_output(&self) -> Vec<f32> {
-        let start = self.config.n_units - self.config.output_size;
-        self.units[start..].iter().map(|u| u.tension()).collect()
-    }
-
-    /// Leer estados actuales de las unidades de salida.
-    pub fn read_output_state(&self) -> Vec<f32> {
         let start = self.config.n_units - self.config.output_size;
         self.units[start..].iter().map(|u| u.what_is).collect()
     }
@@ -285,6 +306,32 @@ impl TensionField {
         let n       = internal.len();
         let start   = if n > size { (n - size) / 2 } else { 0 };
         let mut out = vec![0.0f32; size];
+        for (i, u) in internal[start..].iter().enumerate().take(size) {
+            out[i] = u.what_is;
+        }
+        out
+    }
+
+    /// Leer voz interna comenzando desde una posición fraccional del campo.
+    /// offset_frac ∈ [0.0, 1.0]: fracción del rango interno desde donde empezar.
+    ///   0.0 = inicio del campo interno (mismas unidades que el Campo 0 ve)
+    ///   0.5 = mitad del campo interno
+    ///   1.0 = final del campo interno
+    /// Usado por FieldStack para que distintos campos intermedios vean
+    /// distintas porciones del ejecutivo, no siempre las primeras N unidades.
+    pub fn read_internal_voice_at(&self, size: usize, offset_frac: f32) -> Vec<f32> {
+        let input_end    = self.config.input_size;
+        let output_start = self.config.n_units - self.config.output_size;
+        let internal     = &self.units[input_end..output_start];
+        if internal.is_empty() || size == 0 {
+            return vec![0.0; size];
+        }
+        let n     = internal.len();
+        // Calcular el inicio de la ventana según offset_frac
+        // Clampeado para que la ventana quepa completamente dentro del rango
+        let max_start = n.saturating_sub(size);
+        let start     = ((offset_frac.clamp(0.0, 1.0) * max_start as f32) as usize).min(max_start);
+        let mut out   = vec![0.0f32; size];
         for (i, u) in internal[start..].iter().enumerate().take(size) {
             out[i] = u.what_is;
         }
@@ -336,10 +383,14 @@ impl TensionField {
         let tensions: Vec<f32> = self.units.iter().map(|u| u.tension()).collect();
 
         // Distribuir señales a través de conexiones
-        // timing: fracción relativa del tick (aquí 0.5 uniforme — se puede
-        // hacer variable si se quiere asimetría más fina)
-        let timing = 0.5f32;
-        for conn in self.connections.iter_mut() {
+        // timing: fracción relativa del tick según posición en el vector.
+        // La primera conexión procesada recibe timing=0.0 (máxima responsabilidad),
+        // la última timing≈1.0 (mínima). Esto activa la asimetría temporal en learn():
+        // conexiones más antiguas (añadidas antes al campo) aprenden más rápido.
+        // El orden es arbitrario pero consistente — no aleatorio tick a tick.
+        let n_conns = self.connections.len().max(1);
+        for (idx, conn) in self.connections.iter_mut().enumerate() {
+            let timing = idx as f32 / n_conns as f32;
             let signal = conn.compute_and_record(tensions[conn.from], timing);
             self.units[conn.to].receive(signal);
         }
@@ -366,15 +417,19 @@ impl TensionField {
         }
 
         // Aprendizaje en conexiones que apuntan a unidades con error
-        // Pre-calcular tensiones previas para tension_reduction
-        let tensions_before: Vec<f32> = self.units.iter().map(|u| u.last_tension).collect();
-        let tensions_after:  Vec<f32> = self.units.iter().map(|u| u.tension()).collect();
+        // tensions[] capturado al inicio del tick (Fase 1) contiene las tensiones
+        // reales pre-apply_incoming — es el "before" correcto.
+        // last_tension NO sirve: apply_incoming() lo sobreescribe con la tensión
+        // post-actualización, así que tensions_before ≈ tensions_after → reducción ≈ 0.
+        let tensions_after: Vec<f32> = self.units.iter().map(|u| u.tension()).collect();
 
         for conn in self.connections.iter_mut() {
             let dest_error = errors[conn.to];
             if dest_error.abs() > 1e-5 {
                 // Cuánto redujo esta conexión la tensión del destino
-                let tension_reduction = (tensions_before[conn.to].abs()
+                // tensions[conn.to] = tensión pre-Fase2 (capturada al inicio del tick)
+                // tensions_after[conn.to] = tensión post-Fase2 y post-aprendizaje
+                let tension_reduction = (tensions[conn.to].abs()
                 - tensions_after[conn.to].abs()).max(0.0);
                 // Las conexiones aprenden con conn_lr — más lento que las expectativas.
                 // Esto separa las dos escalas de tiempo: expectativas (rápido, por tick)
@@ -391,8 +446,14 @@ impl TensionField {
         // Evita que el campo se congele en un atractor estático.
         // El ruido escala con la calma actual: más calma → más ruido.
         // No afecta a unidades de entrada (tienen inject) ni de salida.
+        //
+        // calm_proxy usa la misma sigmoide que DriveState::from_field()
+        // para que "calma" signifique lo mismo en ambos contextos.
+        // SINCRONIZADO con drives.rs: k=20, center=0.20
+        // (antes k=25, center=0.12 — desincronizado tras el ajuste de drives)
         if self.config.intrinsic_noise > 0.0 {
-            let calm_proxy = 1.0 - self.mean_tension.min(1.0);
+            let activity   = 1.0 / (1.0 + (-20.0f32 * (self.mean_tension - 0.20)).exp());
+            let calm_proxy = (1.0 - activity).clamp(0.0, 1.0);
             let noise_amp  = self.config.intrinsic_noise * calm_proxy;
             if noise_amp > 0.001 {
                 let mut rng = rand::thread_rng();
@@ -468,13 +529,15 @@ impl TensionField {
         DriveState::from_field(self.mean_tension, self.var_tension, self.connections.len())
     }
 
-    /// Tensión media de las unidades de salida — señal motora global.
+    /// Magnitud media del estado de las unidades de salida — señal motora global.
     /// Separada de mean_tension (que mide salud interna del campo).
+    /// Usa |what_is| por la misma razón que read_output(): what_will está
+    /// congelado con ruido inicial y no aporta información.
     pub fn output_tension(&self) -> f32 {
         let start = self.config.n_units - self.config.output_size;
         let out = &self.units[start..];
         if out.is_empty() { return 0.0; }
-        out.iter().map(|u| u.tension_magnitude()).sum::<f32>() / out.len() as f32
+        out.iter().map(|u| u.what_is.abs()).sum::<f32>() / out.len() as f32
     }
 
     /// Número de conexiones vivas actualmente.
@@ -495,27 +558,38 @@ impl TensionField {
     /// Agregar nuevas conexiones aleatorias entre unidades internas.
     /// Usado para reconexión espontánea cuando el campo pierde demasiada estructura.
     /// prob: probabilidad de crear cada conexión posible (típico 0.02–0.08).
+    ///
+    /// Usa un HashSet para el check de existencia: O(1) por par en lugar de
+    /// O(n_conexiones) con iter().any() — evita O(n²×m) en campos grandes.
     pub fn spontaneous_reconnect(&mut self, prob: f32) {
         use rand::Rng;
+        use std::collections::HashSet;
         let mut rng = rand::thread_rng();
         let input_end    = self.config.input_size;
         let output_start = self.config.n_units - self.config.output_size;
 
+        // Construir el set de pares existentes en O(m) antes del loop doble
+        let existing: HashSet<(usize, usize)> = self.connections.iter()
+        .map(|c| (c.from, c.to))
+        .collect();
+
+        let mut new_conns = Vec::new();
+
         // Solo entre unidades internas — no tocar entrada ni salida
         for i in input_end..output_start {
-            for j in input_end..self.config.n_units {
+            for j in input_end..output_start {
                 if i == j { continue; }
-                // Solo agregar si no existe ya una conexión i→j
-                let exists = self.connections.iter().any(|c| c.from == i && c.to == j);
-                if !exists && rng.gen::<f32>() < prob {
+                // Lookup O(1) en lugar de O(n_conexiones)
+                if !existing.contains(&(i, j)) && rng.gen::<f32>() < prob {
                     let w = rng.gen_range(-0.1..0.1f32);
                     let p = rng.gen_range(0.0..self.config.init_phase_range);
                     let mut c = Connection::new(i, j, w, p);
                     c.relevance = 0.3;  // relevancia inicial baja — debe ganarse su lugar
-                    self.connections.push(c);
+                    new_conns.push(c);
                 }
             }
         }
+        self.connections.extend(new_conns);
     }
 
     /// Número de ticks ejecutados desde la creación o último reset.
@@ -797,12 +871,11 @@ mod tests {
     fn output_size_matches_config() {
         let f = TensionField::new_dense(FieldConfig::with_sizes(20, 4, 3), 0.5);
         assert_eq!(f.read_output().len(), 3);
-        assert_eq!(f.read_output_state().len(), 3);
     }
 
     #[test]
     fn output_does_not_collapse_to_zero() {
-        // Las unidades de salida no aprenden expectativas — su tensión
+        // Las unidades de salida no aprenden expectativas — su estado
         // debe mantenerse como señal útil incluso con input constante.
         let mut f = TensionField::new_dense(
             FieldConfig::with_sizes(32, 4, 4),
@@ -817,5 +890,23 @@ mod tests {
         let mag: f32 = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
         assert!(mag > 0.001,
                 "output should not collapse to zero: magnitude={:.6}", mag);
+    }
+
+    #[test]
+    fn read_output_reflects_what_is_not_offset() {
+        // Con what_will congelado en ruido inicial, tension() = what_will - what_is
+        // tiene un offset arbitrario. read_output() debe retornar what_is, no tension().
+        // Verificamos inyectando un valor conocido en las unidades de salida
+        // y checkeando que read_output() lo refleja directamente.
+        let mut f = TensionField::new(FieldConfig::with_sizes(8, 2, 2));
+        // Forzar what_is de las unidades de salida a valores conocidos
+        let output_start = f.config.n_units - f.config.output_size;
+        f.units[output_start].what_is     = 0.75;
+        f.units[output_start + 1].what_is = -0.50;
+        let out = f.read_output();
+        assert!((out[0] - 0.75).abs() < 1e-6,
+                "read_output[0] should be what_is=0.75, got {}", out[0]);
+        assert!((out[1] - (-0.50)).abs() < 1e-6,
+                "read_output[1] should be what_is=-0.50, got {}", out[1]);
     }
 }

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTD — Curva de Convergencia</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.26.0/plotly.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Syne:wght@400;700;800&display=swap');
+
+  :root {
+    --bg:       #0a0a0f;
+    --surface:  #111118;
+    --border:   #1e1e2e;
+    --accent:   #7c6aff;
+    --accent2:  #ff6a6a;
+    --accent3:  #6affa0;
+    --accent4:  #ffd76a;
+    --text:     #e8e8f0;
+    --muted:    #555570;
+    --glow:     rgba(124,106,255,0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Fondo animado */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 20% 10%, rgba(124,106,255,0.06) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 40% at 80% 90%, rgba(106,255,160,0.04) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 40px 32px;
+  }
+
+  /* Header */
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 48px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .title-group h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: 2.4rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent3) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+
+  .title-group p {
+    color: var(--muted);
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 0.7rem;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent3);
+    box-shadow: 0 0 8px var(--accent3);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* Upload zone */
+  .upload-zone {
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+    padding: 48px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    background: var(--surface);
+    margin-bottom: 40px;
+  }
+
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(124,106,255,0.05);
+    box-shadow: 0 0 30px var(--glow);
+  }
+
+  .upload-zone.has-data {
+    display: none;
+  }
+
+  .upload-icon {
+    font-size: 2rem;
+    margin-bottom: 12px;
+    opacity: 0.5;
+  }
+
+  .upload-zone h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--text);
+  }
+
+  .upload-zone p {
+    color: var(--muted);
+    font-size: 0.75rem;
+    line-height: 1.6;
+  }
+
+  .upload-zone .cmd {
+    display: inline-block;
+    margin-top: 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-size: 0.7rem;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+  }
+
+  #fileInput { display: none; }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 32px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+
+  .stat-card:hover { border-color: var(--accent); }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--accent-color, var(--accent));
+    opacity: 0.7;
+  }
+
+  .stat-label {
+    font-size: 0.65rem;
+    color: var(--muted);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 800;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .stat-delta {
+    font-size: 0.65rem;
+    margin-top: 4px;
+    color: var(--muted);
+  }
+
+  .stat-delta.good { color: var(--accent3); }
+  .stat-delta.bad  { color: var(--accent2); }
+
+  /* Window selector */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+
+  .control-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .control-group label {
+    font-size: 0.7rem;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .seg-control {
+    display: flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .seg-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    padding: 5px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    border-right: 1px solid var(--border);
+  }
+
+  .seg-btn:last-child { border-right: none; }
+
+  .seg-btn.active, .seg-btn:hover {
+    background: var(--accent);
+    color: white;
+  }
+
+  /* Chart containers */
+  .charts-main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .charts-secondary {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    transition: border-color 0.2s;
+  }
+
+  .chart-card:hover { border-color: var(--accent); }
+  .chart-card.full  { grid-column: 1 / -1; }
+
+  .chart-title {
+    font-size: 0.65rem;
+    color: var(--muted);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .chart-title::before {
+    content: '';
+    width: 3px;
+    height: 12px;
+    background: var(--accent);
+    border-radius: 2px;
+    display: inline-block;
+  }
+
+  /* Verdict */
+  .verdict-bar {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .verdict-icon {
+    font-size: 1.5rem;
+    flex-shrink: 0;
+  }
+
+  .verdict-text {
+    font-family: 'Syne', sans-serif;
+    font-size: 1rem;
+    font-weight: 700;
+  }
+
+  .verdict-sub {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  /* Hidden before load */
+  .dashboard { display: none; }
+  .dashboard.visible { display: block; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .charts-main, .charts-secondary { grid-template-columns: 1fr; }
+    .chart-card.full { grid-column: 1; }
+    header { flex-direction: column; gap: 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="title-group">
+      <h1>CTD Convergence</h1>
+      <p>Campo de Tensión Diferencial — Curva de aprendizaje</p>
+    </div>
+    <div class="status-badge">
+      <div class="status-dot"></div>
+      <span id="statusText">esperando datos</span>
+    </div>
+  </header>
+
+  <!-- Upload -->
+  <div class="upload-zone" id="uploadZone">
+    <div class="upload-icon">⬆</div>
+    <h2>Cargar convergence_data.csv</h2>
+    <p>Arrastrar el archivo aquí, o hacer click para seleccionar.<br>
+       Generado con <code>cargo run --bin convergence</code></p>
+    <div class="cmd">cargo run --bin convergence</div>
+  </div>
+  <input type="file" id="fileInput" accept=".csv">
+
+  <!-- Dashboard -->
+  <div class="dashboard" id="dashboard">
+
+    <div class="stats-grid" id="statsGrid"></div>
+
+    <div class="verdict-bar" id="verdictBar"></div>
+
+    <div class="controls">
+      <div class="control-group">
+        <label>Ventana móvil</label>
+        <div class="seg-control">
+          <button class="seg-btn" onclick="setWindow(5)">5</button>
+          <button class="seg-btn active" onclick="setWindow(10)">10</button>
+          <button class="seg-btn" onclick="setWindow(20)">20</button>
+          <button class="seg-btn" onclick="setWindow(50)">50</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <label>Vista</label>
+        <div class="seg-control">
+          <button class="seg-btn active" onclick="setView('all')">Todo</button>
+          <button class="seg-btn" onclick="setView('raw')">Raw</button>
+          <button class="seg-btn" onclick="setView('smooth')">Suavizado</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="charts-main">
+      <div class="chart-card">
+        <div class="chart-title">Hambre Media por Episodio</div>
+        <div id="chartHunger" style="height:280px"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Ticks Vividos por Episodio</div>
+        <div id="chartTicks" style="height:280px"></div>
+      </div>
+    </div>
+
+    <div class="charts-main">
+      <div class="chart-card">
+        <div class="chart-title">Comidas por Episodio</div>
+        <div id="chartEats" style="height:260px"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Primer Comida (tick)</div>
+        <div id="chartFirst" style="height:260px"></div>
+      </div>
+    </div>
+
+    <div class="charts-secondary">
+      <div class="chart-card">
+        <div class="chart-title">Conexiones Vivas</div>
+        <div id="chartConns" style="height:220px"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Tensión del Campo</div>
+        <div id="chartTension" style="height:220px"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Conexiones Podadas (acum.)</div>
+        <div id="chartPruned" style="height:220px"></div>
+      </div>
+    </div>
+
+    <div class="chart-card full">
+      <div class="chart-title">Distribución de Hambre — Cuartos</div>
+      <div id="chartQuarters" style="height:260px"></div>
+    </div>
+
+  </div><!-- /dashboard -->
+
+</div><!-- /container -->
+
+<script>
+// ─── Estado global ────────────────────────────────────────────────────────
+let rawData = [];
+let windowSize = 10;
+let viewMode = 'all';
+
+const PLOTLY_LAYOUT_BASE = {
+  paper_bgcolor: 'transparent',
+  plot_bgcolor:  'transparent',
+  font: { family: 'JetBrains Mono, monospace', size: 10, color: '#555570' },
+  margin: { t: 8, r: 16, b: 40, l: 50 },
+  xaxis: {
+    gridcolor: '#1e1e2e', zerolinecolor: '#1e1e2e',
+    tickfont: { size: 9 }, color: '#555570',
+  },
+  yaxis: {
+    gridcolor: '#1e1e2e', zerolinecolor: '#1e1e2e',
+    tickfont: { size: 9 }, color: '#555570',
+  },
+  showlegend: true,
+  legend: {
+    bgcolor: 'transparent', bordercolor: '#1e1e2e', borderwidth: 1,
+    font: { size: 9, color: '#555570' },
+    x: 0.01, y: 0.99,
+  },
+};
+
+const PLOTLY_CONFIG = { displayModeBar: false, responsive: true };
+
+// ─── Upload ───────────────────────────────────────────────────────────────
+const uploadZone = document.getElementById('uploadZone');
+const fileInput  = document.getElementById('fileInput');
+
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('dragover', e => {
+  e.preventDefault(); uploadZone.classList.add('drag-over');
+});
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    rawData = parseCSV(e.target.result);
+    if (rawData.length === 0) {
+      alert('CSV vacío o formato incorrecto.');
+      return;
+    }
+    uploadZone.classList.add('has-data');
+    document.getElementById('dashboard').classList.add('visible');
+    document.getElementById('statusText').textContent =
+      `${rawData.length} episodios cargados`;
+    renderAll();
+  };
+  reader.readAsText(file);
+}
+
+// ─── CSV Parser ───────────────────────────────────────────────────────────
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const vals = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h] = isNaN(vals[i]) ? vals[i] : parseFloat(vals[i]);
+    });
+    return row;
+  });
+}
+
+// ─── Ventana móvil ────────────────────────────────────────────────────────
+function movingAvg(arr, w) {
+  return arr.map((_, i) => {
+    const start = Math.max(0, i - w + 1);
+    const slice = arr.slice(start, i + 1);
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  });
+}
+
+// ─── Controles ────────────────────────────────────────────────────────────
+function setWindow(w) {
+  windowSize = w;
+  document.querySelectorAll('.seg-control').forEach((sc, idx) => {
+    if (idx === 0) {
+      sc.querySelectorAll('.seg-btn').forEach(b => {
+        b.classList.toggle('active', parseInt(b.textContent) === w);
+      });
+    }
+  });
+  renderAll();
+}
+
+function setView(v) {
+  viewMode = v;
+  document.querySelectorAll('.seg-control').forEach((sc, idx) => {
+    if (idx === 1) {
+      sc.querySelectorAll('.seg-btn').forEach(b => {
+        b.classList.toggle('active', b.textContent.toLowerCase() === v ||
+          (v === 'all' && b.textContent === 'Todo') ||
+          (v === 'smooth' && b.textContent === 'Suavizado') ||
+          (v === 'raw' && b.textContent === 'Raw'));
+      });
+    }
+  });
+  renderAll();
+}
+
+// ─── Render principal ─────────────────────────────────────────────────────
+function renderAll() {
+  renderStats();
+  renderVerdict();
+  renderHunger();
+  renderTicks();
+  renderEats();
+  renderFirstEat();
+  renderConns();
+  renderTension();
+  renderPruned();
+  renderQuarters();
+}
+
+// ─── Stats cards ──────────────────────────────────────────────────────────
+function renderStats() {
+  const n    = rawData.length;
+  const half = Math.floor(n / 2);
+  const first  = rawData.slice(0, half);
+  const second = rawData.slice(half);
+
+  const avg = (arr, key) => arr.reduce((s, r) => s + r[key], 0) / arr.length;
+
+  const h1 = avg(first,  'hunger_mean');
+  const h2 = avg(second, 'hunger_mean');
+  const t1 = avg(first,  'ticks');
+  const t2 = avg(second, 'ticks');
+  const e1 = avg(first,  'times_ate');
+  const e2 = avg(second, 'times_ate');
+  const survived = rawData.filter(r => r.survived === 1).length;
+  const maxEats  = Math.max(...rawData.map(r => r.times_ate));
+
+  const deltaH = ((h2 - h1) / h1 * 100).toFixed(1);
+  const deltaT = ((t2 - t1) / t1 * 100).toFixed(1);
+  const deltaE = ((e2 - e1) / e1 * 100).toFixed(1);
+
+  const cards = [
+    { label: 'Episodios', value: n, delta: '', color: '#7c6aff' },
+    { label: 'Hambre Final', value: h2.toFixed(3),
+      delta: `${deltaH > 0 ? '+' : ''}${deltaH}% vs primera mitad`,
+      good: parseFloat(deltaH) < 0, color: '#ff6a6a' },
+    { label: 'Ticks Final', value: Math.round(t2),
+      delta: `${deltaT > 0 ? '+' : ''}${deltaT}% vs primera mitad`,
+      good: parseFloat(deltaT) > 0, color: '#ffd76a' },
+    { label: 'Comidas/Ep Final', value: e2.toFixed(1),
+      delta: `${deltaE > 0 ? '+' : ''}${deltaE}% vs primera mitad`,
+      good: parseFloat(deltaE) > 0, color: '#6affa0' },
+    { label: 'Supervivencias', value: survived, delta: `de ${n} episodios`, color: '#6adfff' },
+    { label: 'Máx Comidas/Ep',  value: maxEats,  delta: 'mejor episodio', color: '#ff9d6a' },
+  ];
+
+  document.getElementById('statsGrid').innerHTML = cards.map(c => `
+    <div class="stat-card" style="--accent-color:${c.color}">
+      <div class="stat-label">${c.label}</div>
+      <div class="stat-value">${c.value}</div>
+      ${c.delta ? `<div class="stat-delta ${c.good === true ? 'good' : c.good === false ? 'bad' : ''}">${c.delta}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+// ─── Veredicto ────────────────────────────────────────────────────────────
+function renderVerdict() {
+  const n    = rawData.length;
+  const half = Math.floor(n / 2);
+  const avg  = (arr, key) => arr.reduce((s, r) => s + r[key], 0) / arr.length;
+
+  const h1 = avg(rawData.slice(0, half),  'hunger_mean');
+  const h2 = avg(rawData.slice(half),     'hunger_mean');
+  const t1 = avg(rawData.slice(0, half),  'ticks');
+  const t2 = avg(rawData.slice(half),     'ticks');
+
+  // Punto de convergencia: primer ventana de 20 ep donde hunger_mean < 0.45
+  const smoothH = movingAvg(rawData.map(r => r.hunger_mean), 20);
+  const convEp  = smoothH.findIndex(v => v < 0.45);
+
+  let icon, text, sub, color;
+
+  if (h2 < h1 && t2 > t1) {
+    icon = '✓'; color = '#6affa0';
+    text = 'CTD está aprendiendo a sobrevivir';
+    sub  = convEp >= 0
+      ? `Convergencia inicial detectada en ep ~${convEp + 1} (hambre suavizada < 0.45)`
+      : `Mejora sostenida — aún no alcanza umbral de convergencia (hambre < 0.45)`;
+  } else if (h2 < h1 || t2 > t1) {
+    icon = '~'; color = '#ffd76a';
+    text = 'Señales mixtas — aprendizaje parcial';
+    sub  = 'Una métrica mejora, la otra no. Considerar más episodios.';
+  } else {
+    icon = '✗'; color = '#ff6a6a';
+    text = 'Sin mejora observable';
+    sub  = 'Revisar configuración del campo o aumentar episodios.';
+  }
+
+  document.getElementById('verdictBar').innerHTML = `
+    <div class="verdict-icon" style="color:${color}">${icon}</div>
+    <div>
+      <div class="verdict-text" style="color:${color}">${text}</div>
+      <div class="verdict-sub">${sub}</div>
+    </div>
+  `;
+}
+
+// ─── Gráficos individuales ────────────────────────────────────────────────
+function makeTraces(key, label, color, invert = false) {
+  const eps  = rawData.map(r => r.ep);
+  const vals = rawData.map(r => r[key]);
+  const smooth = movingAvg(vals, windowSize);
+
+  const traces = [];
+  if (viewMode === 'all' || viewMode === 'raw') {
+    traces.push({
+      x: eps, y: vals, mode: 'markers',
+      marker: { color, size: 3, opacity: 0.35 },
+      name: label, showlegend: true,
+    });
+  }
+  if (viewMode === 'all' || viewMode === 'smooth') {
+    traces.push({
+      x: eps, y: smooth, mode: 'lines',
+      line: { color, width: 2.5 },
+      name: `${label} (w=${windowSize})`,
+    });
+  }
+  return traces;
+}
+
+function layout(extra = {}) {
+  return { ...PLOTLY_LAYOUT_BASE, ...extra };
+}
+
+function renderHunger() {
+  const traces = makeTraces('hunger_mean', 'Hambre media', '#ff6a6a');
+  // Línea de baseline (agente aleatorio)
+  traces.push({
+    x: [1, rawData.length], y: [0.604, 0.604],
+    mode: 'lines', line: { color: '#555570', width: 1, dash: 'dot' },
+    name: 'baseline aleatorio', showlegend: true,
+  });
+  Plotly.newPlot('chartHunger', traces,
+    layout({ yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, range: [0, 0.8], title: { text: 'hambre', font: { size: 9 } } } }),
+    PLOTLY_CONFIG);
+}
+
+function renderTicks() {
+  const traces = makeTraces('ticks', 'Ticks vividos', '#ffd76a');
+  traces.push({
+    x: [1, rawData.length], y: [100, 100],
+    mode: 'lines', line: { color: '#555570', width: 1, dash: 'dot' },
+    name: 'baseline aleatorio',
+  });
+  Plotly.newPlot('chartTicks', traces, layout(), PLOTLY_CONFIG);
+}
+
+function renderEats() {
+  Plotly.newPlot('chartEats', makeTraces('times_ate', 'Comidas', '#6affa0'),
+    layout(), PLOTLY_CONFIG);
+}
+
+function renderFirstEat() {
+  // -1 = nunca comió → mostrar como null para que no aparezca
+  const eps  = rawData.map(r => r.ep);
+  const vals = rawData.map(r => r.first_eat === -1 ? null : r.first_eat);
+  const smooth = movingAvg(rawData.map(r => r.first_eat === -1 ? 100 : r.first_eat), windowSize);
+
+  const traces = [];
+  if (viewMode === 'all' || viewMode === 'raw') {
+    traces.push({ x: eps, y: vals, mode: 'markers',
+      marker: { color: '#6adfff', size: 3, opacity: 0.4 },
+      name: '1er comer (tick)', showlegend: true });
+  }
+  if (viewMode === 'all' || viewMode === 'smooth') {
+    traces.push({ x: eps, y: smooth, mode: 'lines',
+      line: { color: '#6adfff', width: 2.5 },
+      name: `suavizado (w=${windowSize})` });
+  }
+  Plotly.newPlot('chartFirst', traces,
+    layout({ yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, title: { text: 'tick', font: { size: 9 } } } }),
+    PLOTLY_CONFIG);
+}
+
+function renderConns() {
+  Plotly.newPlot('chartConns', makeTraces('connections', 'Conexiones', '#7c6aff'),
+    layout(), PLOTLY_CONFIG);
+}
+
+function renderTension() {
+  Plotly.newPlot('chartTension', makeTraces('tension', 'Tensión', '#ff9d6a'),
+    layout(), PLOTLY_CONFIG);
+}
+
+function renderPruned() {
+  const eps  = rawData.map(r => r.ep);
+  const vals = rawData.map(r => r.pruned);
+  Plotly.newPlot('chartPruned', [{
+    x: eps, y: vals, mode: 'lines',
+    line: { color: '#aa6aff', width: 2 },
+    fill: 'tozeroy', fillcolor: 'rgba(170,106,255,0.08)',
+    name: 'podadas (acum.)',
+  }], layout(), PLOTLY_CONFIG);
+}
+
+function renderQuarters() {
+  const n = rawData.length;
+  const q = Math.floor(n / 4);
+  if (q === 0) return;
+
+  const quarters = [
+    rawData.slice(0,   q),
+    rawData.slice(q,   2*q),
+    rawData.slice(2*q, 3*q),
+    rawData.slice(3*q),
+  ];
+
+  const colors = ['#7c6aff', '#6affa0', '#ffd76a', '#ff6a6a'];
+  const labels = ['Q1', 'Q2', 'Q3', 'Q4'];
+
+  const traces = quarters.map((qd, i) => ({
+    y: qd.map(r => r.hunger_mean),
+    type: 'box',
+    name: labels[i],
+    marker: { color: colors[i] },
+    boxmean: true,
+    fillcolor: colors[i].replace(')', ',0.2)').replace('rgb', 'rgba'),
+    line: { color: colors[i] },
+  }));
+
+  Plotly.newPlot('chartQuarters', traces,
+    layout({
+      yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis,
+        title: { text: 'hambre media', font: { size: 9 } }, range: [0, 0.8] },
+      boxmode: 'group',
+    }), PLOTLY_CONFIG);
+}
+</script>
+</body>
+</html>

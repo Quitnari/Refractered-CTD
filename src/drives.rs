@@ -121,8 +121,10 @@ impl DriveState {
         //   mean_tension=0.12 → activity≈0.50  (umbral central)
         //   mean_tension=0.20 → activity≈0.87  (actividad alta)
         //   mean_tension=0.50 → activity≈1.00  (saturación)
-        let k = 25.0f32;
-        let center = 0.12f32;
+
+        // let k = 25.0f32;
+        let k = 30.0f32;      // Pendiente más fuerte
+        let center = 0.08f32; // Bajamos el centro de 0.12 a 0.08
         let activity = (1.0 / (1.0 + (-k * (mean_tension - center)).exp())).clamp(0.0, 1.0);
 
         // Curiosidad: actividad presente + error bien distribuido (norm_var bajo)
@@ -140,7 +142,8 @@ impl DriveState {
 
         // Vitalidad: función del número de conexiones
         // Umbrales arbitrarios calibrables — 500 conns = 100% vitalidad
-        let vitality = ((connection_count as f32) / 500.0).clamp(0.0, 1.0);
+        // De 500.0 a 1000.0 por pruebas
+        let vitality = ((connection_count as f32) / 1000.0).clamp(0.0, 1.0);
 
         Self {
             curiosity,

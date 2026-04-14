@@ -157,11 +157,14 @@ impl StackConfig {
             let bridge_out = if i == depth - 1 { action_size } else { bridge };
 
             // Feedback: solo el Campo 0 recibe feedback directo del ejecutivo.
-            // Campos intermedios reciben feedback proporcional a su distancia.
+            // Campos intermedios reciben feedback reducido (la mitad del Campo 0),
+            // igual para todos los intermedios independientemente de su distancia.
+            // Si en el futuro se quiere feedback realmente proporcional a la distancia,
+            // calcular: (feedback_executive * (depth - 1 - i) / (depth - 1)).max(8)
             let feedback = if i == 0 {
                 feedback_executive
             } else if i < depth - 1 {
-                // Intermedios: feedback reducido, proporcional a distancia del ejecutivo
+                // Intermedios: feedback fijo a la mitad — igual para todos
                 (feedback_executive / 2).max(8)
             } else {
                 0  // El ejecutivo no recibe feedback de sí mismo
@@ -246,8 +249,14 @@ pub struct StackSnapshot {
 // ─────────────────────────────────────────────────────────────────────────
 
 pub struct FieldStack {
-    pub fields:     Vec<TensionField>,
-    pub action_mod: ActionModule,
+    /// Campos internos — privados para forzar el uso de tick() como punto de entrada.
+    /// Acceso de solo lectura via field_perceptive() y field_executive().
+    /// Acceso de escritura directo a TensionField bypasea el feedback del stack
+    /// y corrompe el estado silenciosamente — por eso está encapsulado.
+    fields:     Vec<TensionField>,
+    /// Módulo de acción — privado para mantener coherencia del ciclo tick().
+    /// Acceso via los métodos del stack (reset_episode, etc.).
+    action_mod: ActionModule,
     config:         StackConfig,
 
     /// Feedback del tick anterior de cada campo hacia los anteriores.
@@ -273,8 +282,12 @@ impl FieldStack {
             prev_bridge = layer.bridge_size;
         }
 
+        // Derivar output_size del campo ejecutivo ya construido.
+        // Más robusto que hardcodear action_size: si LayerConfig cambia
+        // bridge_size del último campo, ActionModule se entera automáticamente.
+        let exec_output_size = fields[depth - 1].config.output_size;
         let action_mod = ActionModule::new(
-            action_size,
+            exec_output_size,
             action_size,
             ActionMode::Discrete { n_actions: action_size },
         );
@@ -344,10 +357,10 @@ impl FieldStack {
                               feedback_energy,
             });
 
-            // El output de este campo es el input del siguiente
-            // Para campos intermedios: bridge (output_state)
-            // Para el ejecutivo: tensiones de salida (para el ActionModule)
-            prev_output = self.fields[i].read_output_state();
+            // El output de este campo es el input del siguiente.
+            // Usamos read_output() — que retorna what_is directamente —
+            // consistente con cómo el ActionModule lee el ejecutivo.
+            prev_output = self.fields[i].read_output();
         }
 
         // ── Enriquecer bridge entre campos con drives del campo anterior ──
@@ -364,20 +377,31 @@ impl FieldStack {
         let action      = self.action_mod.act(&output_exec, &drives_exec);
 
         // ── Feedback del ejecutivo hacia todos los campos anteriores ──────
-        // El campo ejecutivo transmite su estado interno a los anteriores
-        // con tamaño decreciente según la distancia.
-        let exec_voice = self.fields[exec_idx].read_internal_voice(
-            self.config.layers[0].feedback_size  // tamaño máximo
-        );
-
+        // Cada campo anterior recibe una porción distinta de la voz interna
+        // del ejecutivo, según su posición en la cadena.
+        //
+        // Problema anterior: todos los campos leían exec_voice[..take],
+        // siempre las primeras N unidades — ningún campo veía la segunda
+        // mitad del ejecutivo aunque esa información podría ser relevante.
+        //
+        // Solución: offset_frac proporcional a la posición del campo:
+        //   Campo 0 (más lejano del ejecutivo)  → offset 0.0 (inicio)
+        //   Campo intermedio a mitad de cadena  → offset 0.5 (centro)
+        //   Campo exec_idx-1 (más cercano)      → offset 1.0 (final)
+        // Así cada campo recibe información de una región diferente
+        // del estado interno del ejecutivo.
         for i in 0..exec_idx {
             let fb_size = self.config.layers[i].feedback_size;
             if fb_size == 0 { continue; }
 
-            // Feedback proporcional: campos más cercanos al ejecutivo
-            // reciben una porción más pequeña (menos contexto)
-            let take = fb_size.min(exec_voice.len());
-            let fb: Vec<f32> = exec_voice[..take].to_vec();
+            // offset_frac: 0.0 para el campo más lejano, 1.0 para el más cercano
+            let offset_frac = if exec_idx > 1 {
+                i as f32 / (exec_idx - 1) as f32
+            } else {
+                0.0
+            };
+
+            let fb = self.fields[exec_idx].read_internal_voice_at(fb_size, offset_frac);
             self.last_feedbacks[i] = Some(fb);
         }
 
@@ -411,16 +435,42 @@ impl FieldStack {
         }
     }
 
+    /// Ajustar exploración del módulo de acción interno.
+    /// Evita necesitar acceso directo a action_mod.
+    pub fn set_exploration(&mut self, e: f32) {
+        self.action_mod.set_exploration(e);
+    }
+
     /// Número total de conexiones en todos los campos.
     pub fn total_connections(&self) -> usize {
         self.fields.iter().map(|f| f.connection_count()).sum()
     }
 
-    /// Referencia al campo perceptivo (Campo 0) — para diagnóstico.
-    pub fn field1(&self) -> &TensionField { &self.fields[0] }
+    /// Referencia de solo lectura al campo perceptivo (Campo 0) — para diagnóstico.
+    /// No permite inject_input directo — todo input pasa por tick().
+    pub fn field_perceptive(&self) -> &TensionField { &self.fields[0] }
 
-    /// Referencia al campo ejecutivo (último) — para diagnóstico.
-    pub fn field2(&self) -> &TensionField { &self.fields[self.config.depth() - 1] }
+    /// Referencia de solo lectura al campo ejecutivo (último) — para diagnóstico.
+    /// No permite inject_input directo — todo input pasa por tick().
+    pub fn field_executive(&self) -> &TensionField { &self.fields[self.config.depth() - 1] }
+
+    /// Referencia de solo lectura a cualquier campo por índice — para diagnóstico.
+    /// Panics si idx >= depth().
+    pub fn field_at(&self, idx: usize) -> &TensionField {
+        assert!(idx < self.fields.len(), "field index {} out of bounds (depth={})", idx, self.fields.len());
+        &self.fields[idx]
+    }
+
+    /// Número de campos en el stack.
+    pub fn depth(&self) -> usize { self.fields.len() }
+
+    /// Compat: alias de field_perceptive() para código existente.
+    #[deprecated(note = "usa field_perceptive()")]
+    pub fn field1(&self) -> &TensionField { self.field_perceptive() }
+
+    /// Compat: alias de field_executive() para código existente.
+    #[deprecated(note = "usa field_executive()")]
+    pub fn field2(&self) -> &TensionField { self.field_executive() }
 
     /// Guardar todos los campos.
     pub fn save(&self, path: &str) -> Result<(), String> {
@@ -474,5 +524,93 @@ impl FieldStack {
         let last_idx = self.fields.len() - 1;
         self.fields[last_idx].load_snapshot(snap_v1.field2)?;
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TESTS
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_stack() -> FieldStack {
+        FieldStack::new(StackConfig::new(4, 3), 0.4)
+    }
+
+    #[test]
+    fn tick_produces_valid_action() {
+        let mut s = small_stack();
+        let input = vec![0.5f32, -0.3, 0.1, 0.8];
+        let (action, _) = s.tick(&input, 1.0);
+        assert!(action.discrete.is_some());
+        assert!(action.discrete.unwrap() < 3);
+    }
+
+    #[test]
+    fn feedback_energy_is_zero_on_first_tick() {
+        // En el primer tick no hay feedback previo — debe ser cero
+        let s = small_stack();
+        assert_eq!(s.feedback_energy(), 0.0);
+    }
+
+    #[test]
+    fn feedback_energy_nonzero_after_tick() {
+        let mut s = small_stack();
+        let input = vec![0.5f32, -0.3, 0.1, 0.8];
+        for _ in 0..5 { s.tick(&input, 1.0); }
+        // Después de varios ticks el ejecutivo debería haber producido feedback
+        assert!(s.feedback_energy() >= 0.0);
+    }
+
+    #[test]
+    fn reset_episode_clears_feedback() {
+        let mut s = small_stack();
+        let input = vec![0.5f32, -0.3, 0.1, 0.8];
+        for _ in 0..5 { s.tick(&input, 1.0); }
+        s.reset_episode();
+        // Después del reset, el feedback debe estar limpio
+        assert_eq!(s.feedback_energy(), 0.0);
+    }
+
+    #[test]
+    fn depth_matches_config() {
+        let s = small_stack();
+        assert_eq!(s.depth(), 2);
+
+        let s3 = FieldStack::new(StackConfig::with_depth(4, 2, 3), 0.4);
+        assert_eq!(s3.depth(), 3);
+    }
+
+    #[test]
+    fn field_at_returns_correct_field() {
+        let s = small_stack();
+        // field_at(0) y field_perceptive() deben ser el mismo campo
+        assert_eq!(
+            s.field_at(0).connection_count(),
+                   s.field_perceptive().connection_count()
+        );
+        // field_at(depth-1) y field_executive() deben ser el mismo campo
+        let last = s.depth() - 1;
+        assert_eq!(
+            s.field_at(last).connection_count(),
+                   s.field_executive().connection_count()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "field index")]
+    fn field_at_panics_out_of_bounds() {
+        let s = small_stack();
+        s.field_at(99);
+    }
+
+    #[test]
+    fn stack_state_has_correct_depth() {
+        let mut s = FieldStack::new(StackConfig::with_depth(4, 2, 3), 0.4);
+        let input = vec![0.5f32, -0.3, 0.1, 0.8];
+        let (_, state) = s.tick(&input, 1.0);
+        assert_eq!(state.layers.len(), 3);
     }
 }

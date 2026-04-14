@@ -35,8 +35,11 @@
 // relativo al error: señales que llegaron antes del error absorben más
 // del ajuste que las que llegaron después.
 //
-// Esto se implementa via un timestamp relativo: cada conexión registra
-// en qué fracción del tick anterior contribuyó. La fracción modula el lr.
+// Esto se implementa via un valor de antigüedad: cada conexión recibe
+// un índice proporcional a su posición en el vector de conexiones.
+// Las conexiones más antiguas (índice bajo) tienen timing≈0 y aprenden más rápido.
+// Las más nuevas (índice alto) tienen timing≈1 y aprenden más despacio.
+// NOTA: 'timing' es en realidad antigüedad estructural, no tiempo dentro del tick.
 //
 // OLVIDO INTRÍNSECO
 // ─────────────────
@@ -67,13 +70,20 @@ pub struct Connection {
     /// Cuando cae a 0, la conexión desaparece.
     pub relevance: f32,
 
-    /// Fracción del tick en que esta conexión contribuyó por última vez.
-    /// 0.0 = al principio del tick, 1.0 = al final.
-    /// Usado para asimetría temporal en el aprendizaje.
+    /// Antigüedad relativa de la conexión ∈ [0, 1].
+    /// 0.0 = conexión más antigua (aprende más rápido), 1.0 = más nueva (más lento).
+    /// Se asigna en field.rs según posición en el vector de conexiones, no por tiempo real.
+    /// Modula el learning rate en learn() via temporal_factor.
     pub(crate) contrib_timing: f32,
 
     /// Contribución absoluta al último tick (para calcular relevance).
     pub(crate) last_contribution: f32,
+
+    /// Tensión del origen en el último tick — necesaria para calcular
+    /// en qué dirección ajustar el peso durante el aprendizaje.
+    /// Sin esto, learn() no sabe si esta conexión empujó al destino
+    /// hacia arriba o hacia abajo.
+    pub(crate) last_origin_tension: f32,
 }
 
 impl Connection {
@@ -87,6 +97,7 @@ impl Connection {
             relevance: 1.0,
             contrib_timing: 0.5,
             last_contribution: 0.0,
+            last_origin_tension: 0.0,
         }
     }
 
@@ -107,6 +118,7 @@ impl Connection {
     pub(crate) fn compute_and_record(&mut self, origin_tension: f32, timing: f32) -> f32 {
         let s = self.signal(origin_tension);
         self.last_contribution = s.abs();
+        self.last_origin_tension = origin_tension;
         self.contrib_timing = timing.clamp(0.0, 1.0);
         s
     }
@@ -129,11 +141,32 @@ impl Connection {
 
         let lr = (base_lr * temporal_factor).clamp(0.0001, 0.3);
 
-        // Ajuste de peso: moverse en dirección que habría reducido el error
-        // Si el error es positivo (was_is > what_will), la conexión debería
-        // haber empujado más hacia what_is. El ajuste depende del signo del error
-        // y de la contribución de esta conexión.
-        let weight_delta = lr * error * self.phase.cos();
+        // Ajuste de peso: moverse en dirección que habría reducido el error.
+        //
+        // La señal real que esta conexión transmitió fue:
+        //   signal = origin_tension × weight × cos(phase)
+        //
+        // Para saber si esa señal fue en la dirección correcta necesitamos
+        // origin_tension. Sin él, el ajuste no puede distinguir si la conexión
+        // empujó el destino hacia arriba o hacia abajo.
+        //
+        // Ejemplo de por qué importa:
+        //   origin_tension = -0.8, weight = 0.5, phase ≈ 0
+        //   → signal = -0.4  (bajó el destino)
+        //   Si error > 0 (destino necesitaba subir), el peso debería BAJAR.
+        //   Sin origin_tension, weight_delta = lr * error > 0 → sube. Incorrecto.
+        //   Con origin_tension, weight_delta = lr * error * (-0.8) < 0 → baja. Correcto.
+        //
+        // Normalizamos origin_tension con signum() para que solo aporte dirección,
+        // no magnitud — evita que orígenes muy activos dominen el aprendizaje
+        // y que orígenes silenciosos (≈ 0) bloqueen el ajuste con un factor diminuto.
+        let origin_sign = if self.last_origin_tension.abs() > 1e-4 {
+            self.last_origin_tension.signum()
+        } else {
+            0.0  // origen silencioso: esta conexión no contribuyó, no ajustar
+        };
+
+        let weight_delta = lr * error * origin_sign * self.phase.cos();
         self.weight = (self.weight + weight_delta).clamp(-1.0, 1.0);
 
         // Ajuste de fase: más lento (lr_phase = lr * 0.05)
@@ -158,17 +191,21 @@ impl Connection {
         // Actualizar relevancia
         // Sube si la conexión contribuyó a reducir tensión
         // Baja pasivamente cada tick
+        // 0.997 por tick cuando aprende sin boost → muere en ~1,700 ticks sin contribución.
+        // Mantiene la misma relación que decay_relevance (0.999): learn decay ≈ 3× más rápido.
         let relevance_boost = if tension_reduction > 0.01 {
             tension_reduction.min(0.05)
         } else {
             0.0
         };
-        self.relevance = (self.relevance * 0.9995 + relevance_boost).clamp(0.0, 1.0);
+        self.relevance = (self.relevance * 0.997 + relevance_boost).clamp(0.0, 1.0);
     }
 
     /// Decay pasivo de relevancia (llamado cada tick aunque no haya aprendizaje).
+    /// 0.999 por tick → una conexión sin uso muere en ~5,300 ticks.
+    /// Antes era 0.9998 → 26,500 ticks — demasiado lento para que la poda sea efectiva.
     pub(crate) fn decay_relevance(&mut self) {
-        self.relevance *= 0.9998;
+        self.relevance *= 0.999;
     }
 
     /// ¿Debe eliminarse esta conexión?
@@ -234,6 +271,22 @@ mod tests {
     }
 
     #[test]
+    fn connection_dies_within_reasonable_ticks() {
+        // Una conexión sin uso debe morir en < 10,000 ticks.
+        // Con decay=0.999 desde relevance=1.0 hasta is_dead (<0.005):
+        // ln(0.005) / ln(0.999) ≈ 5,300 ticks.
+        // Si este test falla, el decay es demasiado lento para que la poda sea efectiva.
+        let mut c = Connection::new(0, 1, 0.5, 0.0);
+        let mut ticks = 0usize;
+        while !c.is_dead() && ticks < 10_000 {
+            c.decay_relevance();
+            ticks += 1;
+        }
+        assert!(c.is_dead(),
+                "connection should die within 10,000 ticks without use, took {} ticks", ticks);
+    }
+
+    #[test]
     fn connection_dies_without_use() {
         let mut c = Connection::new(0, 1, 0.5, 0.0);
         // Forzar relevancia muy baja
@@ -245,14 +298,44 @@ mod tests {
     fn learning_moves_weight_toward_correction() {
         let mut c = Connection::new(0, 1, 0.0, 0.0);
         let initial = c.weight;
-        // Error positivo → el peso debería moverse en dirección del error
+        // Simular que el origen tuvo tensión positiva antes de aprender
+        // Error positivo + origen positivo → peso debería subir
+        c.last_origin_tension = 1.0;
         c.learn(0.5, 0.1, 0.1);
-        assert!(c.weight > initial, "weight should increase with positive error");
+        assert!(c.weight > initial, "weight should increase with positive error and positive origin");
+    }
+
+    #[test]
+    fn learning_direction_depends_on_origin_sign() {
+        // Con origen positivo y error positivo → peso sube
+        let mut c_pos = Connection::new(0, 1, 0.0, 0.0);
+        c_pos.last_origin_tension = 0.8;
+        c_pos.learn(0.5, 0.1, 0.1);
+
+        // Con origen negativo y error positivo → peso baja
+        // (la conexión empujó al destino en dirección equivocada)
+        let mut c_neg = Connection::new(0, 1, 0.0, 0.0);
+        c_neg.last_origin_tension = -0.8;
+        c_neg.learn(0.5, 0.1, 0.1);
+
+        assert!(c_pos.weight > 0.0, "positive origin + positive error → weight up: {}", c_pos.weight);
+        assert!(c_neg.weight < 0.0, "negative origin + positive error → weight down: {}", c_neg.weight);
+    }
+
+    #[test]
+    fn learning_silent_origin_does_not_move_weight() {
+        // Un origen silencioso no contribuyó — no debe ajustarse
+        let mut c = Connection::new(0, 1, 0.5, 0.0);
+        let initial = c.weight;
+        c.last_origin_tension = 0.0;  // silencioso
+        c.learn(1.0, 0.5, 0.1);
+        assert_eq!(c.weight, initial, "silent origin should not change weight");
     }
 
     #[test]
     fn weight_stays_in_range_after_learning() {
         let mut c = Connection::new(0, 1, 0.95, 0.0);
+        c.last_origin_tension = 1.0;
         for _ in 0..1000 {
             c.learn(1.0, 0.5, 1.0);
         }
@@ -265,6 +348,9 @@ mod tests {
         let mut c_late  = Connection::new(0, 1, 0.0, 0.0);
         c_early.contrib_timing = 0.0;
         c_late.contrib_timing  = 1.0;
+        // Mismo origen positivo para ambas — el timing es la única diferencia
+        c_early.last_origin_tension = 1.0;
+        c_late.last_origin_tension  = 1.0;
         c_early.learn(0.5, 0.1, 0.1);
         c_late.learn(0.5, 0.1, 0.1);
         // La conexión temprana debe haber aprendido más (mayor delta de peso)

@@ -74,7 +74,7 @@ pub struct ActionModule {
     /// Huella del input anterior — usada para detectar cambios de contexto.
     /// Cuando el input cambia bruscamente, el momentum se amortigua
     /// para no contaminar la respuesta a la nueva situación.
-    /// Solo los primeros `FINGERPRINT_SIZE` componentes del output proyectado.
+    /// Tiene tamaño `action_size` — cubre el vector proyectado completo.
     last_fingerprint: Vec<f32>,
 }
 
@@ -106,7 +106,9 @@ impl ActionModule {
             action_size,
             projection,
             momentum:         vec![0.0; action_size],
-            momentum_decay:   0.80,
+            momentum_decay:   0.84, // 0.88 hacía que el agente tardara más en encontrar
+            // la primera comida (first_eat 24→39 ticks). Con 0.84
+            // mantiene más consistencia que 0.82 pero sin perder reflejos.
             base_exploration: 0.1,
             last_fingerprint: vec![0.0; action_size],
         }
@@ -143,14 +145,17 @@ impl ActionModule {
 
         // 2. Modular intensidad por malestar
         // Más malestar → acción más intensa (amplificar señal)
-        let intensity = 1.0 + drives.discomfort * 0.8;
+        // let intensity = 1.0 + drives.discomfort * 0.8;
+        let intensity = 1.0 + drives.discomfort * 0.15; // 0.3 → 0.15: con discomfort≈0.6 permanente,
+        // amplificar 30% distorsionaba la señal del campo.
         for v in projected.iter_mut() {
             *v = (*v * intensity).clamp(-1.0, 1.0);
         }
 
         // 3. Aplicar momentum (suavizar cambios tick a tick)
         // momentum_strength: más calma → más momentum (más conservador)
-        let momentum_strength = (self.momentum_decay + drives.calm * 0.15).clamp(0.0, 0.92);
+        // let momentum_strength = (self.momentum_decay + drives.calm * 0.15).clamp(0.0, 0.92);
+        let momentum_strength = (self.momentum_decay + drives.calm * 0.15).clamp(0.0, 0.93); // techo 0.95→0.93
         for i in 0..self.action_size {
             self.momentum[i] = self.momentum[i] * momentum_strength
             + projected[i] * (1.0 - momentum_strength);
